@@ -506,7 +506,11 @@ curl -X POST http://localhost:8000/api/tasks/42/review-plan \
   1. **同卷别接触边总数**最少；
   2. 同最优值时按**行优先、卷号升序**固定结果——把逐座卷号按行优先展平后的序列取字典序最小（第一个不同的座位上卷号尽可能小），唯一破缺对称性，保证可复现。
 
-### 请求示例
+> **最优性保证（仅证明最优才返回可行）**：求解按“接触边最少 → 逐块字典序破平”分阶段进行，每阶段都有求解限时。只有当接触边总数目标取得 `OPTIMAL`（已证明全局最小）、且**每个行优先破平分块**都在固定此前各块的前提下证明本块最优时，才返回 `feasible`。任一阶段在限时内**只找到可行解而未证明最优**（或完全无法判定）时，返回 `error` 结构，**不携带 `grid` / `seats` / `contact_edges` 等任何部分排布**——因为仅可行的解可能接触边并非最少，而首个未完成破平分块之前沿用上一阶段的排布只对已固定分块最优，整段卷号序列不满足字典序规则。行列、不可用座位与各卷印量等回显字段在错误时照常返回。6×6 及以下的常规题通常在毫秒级完成全部证明；下列“限时场景”仅在求解器受限时出现。
+
+### 调用示例
+
+#### 成功场景
 
 ```bash
 curl -X POST http://localhost:8000/api/tasks/42/seat-plan \
@@ -569,6 +573,48 @@ curl -X POST http://localhost:8000/api/tasks/42/seat-plan \
 - `available_seats`：可用座位数（`total_seats − 不可用座位数`）；`quantities` / `unavailable_seats` 回显请求。
 
 > 例如 3×3 全场可用、印量 `[5, 4]` 时可以做到完全棋盘式交错，`contact_edges` 为 `0`；受空位分割或印量失衡限制无法完全交错时（如上例），返回的接触边数已是所有可行排布中的最小值。
+
+### 限时场景（`error`，不返回部分排布）
+
+求解器为“接触边总数”与每个行优先破平分块分别设定了求解限时（单线程、固定种子）。若某一阶段限时内**只找到可行解却未证明最优**，或完全无法判定，接口同步返回 HTTP `200`、`status: "error"` 与诊断信息；响应**只含回显字段**（`rows` / `cols` / `paper_count` / `quantities` / `available_seats` / `unavailable_seats`）与 `error`，不含 `grid`、`seats`、`empty_seats`、`contact_edges`、`total_seats` 等任何部分排布，调用方可在稍后原样重试（请求与种子不变，结果可复现；一旦全部阶段证明最优即返回可行排布）：
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/42/seat-plan \
+  -H "Content-Type: application/json" \
+  -d '{"rows": 6, "cols": 6, "quantities": [12, 12, 12]}'
+```
+
+接触边目标未能在限时内证明最优时：
+
+```json
+{
+  "task_id": 42,
+  "status": "error",
+  "rows": 6,
+  "cols": 6,
+  "paper_count": 3,
+  "quantities": [12, 12, 12],
+  "available_seats": 36,
+  "unavailable_seats": [],
+  "error": "求解器在规定时间内无法判定接触边总数的最优值"
+}
+```
+
+接触边已证明最少、但某个行优先破平分块未能在限时内证明字典序最优时（同样不返回排布）：
+
+```json
+{
+  "task_id": 42,
+  "status": "error",
+  "rows": 6,
+  "cols": 6,
+  "paper_count": 3,
+  "quantities": [12, 12, 12],
+  "available_seats": 36,
+  "unavailable_seats": [],
+  "error": "求解器在规定时间内无法证明行优先卷号序列的字典序最优"
+}
+```
 
 ### 拒绝情形
 

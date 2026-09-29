@@ -13,7 +13,15 @@
 避免指数权重溢出，同时唯一破缺座位与卷别之间的对称性。
 
 入参印量总和由接口层保证等于可用座位数（Pydantic 校验，不等即 422），因此
-约束本身恒可行；仅在求解器限时内无法判定时返回 error，绝不返回部分方案。
+约束本身恒可行。择优分两个阶段求解，**任一阶段在限时内只找到可行解而未证明
+最优（或完全无法判定）时都返回 error，绝不返回部分方案**：
+
+  - 阶段 1 必须证明接触边总数的最优值（仅 FEASIBLE 不被接受，其目标值可能
+    不是全局最小）；
+  - 阶段 2 的每个行优先破平分块都必须在固定此前各块的前提下证明本块最优，
+    首个未完成分块之前的排布不能沿用——它只对已固定的分块字典序最小，整段
+    卷号序列未必满足字典序规则。
+
 全部求解单线程、固定随机种子，同一任务同一请求结果可复现。
 """
 from __future__ import annotations
@@ -107,7 +115,11 @@ def solve_seat_plan(
     quantities: List[int],
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """求解考场卷别排布，返回可行方案；限时内无法判定时返回 error。
+    """求解考场卷别排布。
+
+    仅当接触边总数最少这一目标与全部行优先破平分块都被证明为最优时，才返回
+    可行排布（逐座卷号、空位与接触边数）；任一阶段在限时内仅找到可行解而未
+    证明最优、或完全无法判定时，返回 error 结构且不含任何部分排布。
 
     unavailable 为 (行, 列) 列表（均从 0 起，已由接口层去重并校验在界内）；
     quantities 为按卷号 0..P-1 的各卷印量，长度为卷数（2~5），总和已由
@@ -134,7 +146,13 @@ def solve_seat_plan(
         ],
     }
 
-    # 阶段 1：同卷别接触边总数最少
+    def error_result(message: str) -> Dict[str, Any]:
+        # 错误结构只含回显与诊断，绝不携带 grid/seats/contact_edges 等部分排布
+        return {"status": "error", **base, "error": message}
+
+    # 阶段 1：同卷别接触边总数最少。
+    # 必须取得 OPTIMAL：限时内仅找到可行解（FEASIBLE）时其目标值可能并非全局
+    # 最小，把它固定下来会让后续排布满足印量却不满足“最少接触边”择优目标。
     m, z, contact = _build_model(rows, cols, available, quantities)
     m.Minimize(contact)
     s = _solver(seed)
@@ -146,17 +164,16 @@ def solve_seat_plan(
             "message": "不存在满足各卷印量的座位分配方案",
             **base,
         }
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {
-            "status": "error",
-            **base,
-            "error": "求解器在规定时间内无法判定可行性",
-        }
+    if status != cp_model.OPTIMAL:
+        # FEASIBLE（仅找到可行解，未证明最优）/ UNKNOWN（未得解）同样拒绝
+        return error_result("求解器在规定时间内无法判定接触边总数的最优值")
     best_contact = int(s.Value(contact))
-    chosen = [[bool(s.Value(z[sx][p])) for p in range(P)] for sx in range(S)]
 
     # 阶段 2：行优先、卷号升序固定结果——逐块最小化行优先卷号序列的 P 进制编码，
     # 并固定此前各块的最优值；座位/卷别间的对称被唯一破缺，结果可复现。
+    # 每个分块都必须取得 OPTIMAL 才算证实其字典序最小：若首个未完成分块在限时内
+    # 只得到可行解，沿用上一阶段排布只会对已固定分块最优，整段序列不满足字典序
+    # 规则，因此直接返回 error，不返回任何部分排布。
     n_chunks = (S + CHUNK_BITS - 1) // CHUNK_BITS
     fixed: List[Tuple[int, int]] = []  # (块 k, 块值)
     for k in range(n_chunks):
@@ -170,11 +187,14 @@ def solve_seat_plan(
         m.Minimize(enc)
         s = _solver(seed)
         status = s.Solve(m)
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            break  # 保留此前已得的最优排布
+        if status != cp_model.OPTIMAL:
+            return error_result(
+                "求解器在规定时间内无法证明行优先卷号序列的字典序最优"
+            )
         fixed.append((k, int(s.Value(enc))))
-        chosen = [[bool(s.Value(z[sx][p])) for p in range(P)] for sx in range(S)]
 
+    # 全部择优阶段均已证明最优，取最后一个阶段的解构造逐座结果
+    chosen = [[bool(s.Value(z[sx][p])) for p in range(P)] for sx in range(S)]
     papers: List[int] = [
         next(p for p in range(P) if chosen[sx][p]) for sx in range(S)
     ]
@@ -191,7 +211,8 @@ def solve_seat_plan(
         grid[r][c] = p
         seats.append({"row": r, "col": c, "paper": p})
 
-    # 按最终排布重数接触边（与求解器目标同口径，顺带核对最优值）
+    # 按最终排布重数接触边（与求解器目标同口径）；与已证明的最优值不符说明
+    # 得到的排布不满足最少接触边目标，此时宁可报错也不返回伪最优排布。
     edge_count = 0
     for r in range(rows):
         for c in range(cols):
@@ -201,6 +222,8 @@ def solve_seat_plan(
                 edge_count += 1
             if (r, c + 1) in paper_by_pos and paper_by_pos[(r, c + 1)] == paper_by_pos[(r, c)]:
                 edge_count += 1
+    if edge_count != best_contact:
+        return error_result("内部校验失败：最终排布的接触边数与已证明的最优值不一致")
 
     return {
         "status": "feasible",
