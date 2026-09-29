@@ -13,7 +13,10 @@
 避免指数权重溢出，同时唯一破缺座位与卷别之间的对称性。
 
 入参印量总和由接口层保证等于可用座位数（Pydantic 校验，不等即 422），因此
-约束本身恒可行；仅在求解器限时内无法判定时返回 error，绝不返回部分方案。
+硬约束本身恒可行。**只有接触边目标与每一个行优先破平分块都被求解器证实达到
+最优（OPTIMAL）时才返回 feasible**；任一阶段在限时内仅找到可行解（FEASIBLE，
+未证明最优）或无法判定时，一律返回 error 且不携带任何部分排布（grid/seats/
+empty_seats/contact_edges 均缺省），绝不沿用上一阶段的排布冒充最优。
 全部求解单线程、固定随机种子，同一任务同一请求结果可复现。
 """
 from __future__ import annotations
@@ -107,11 +110,14 @@ def solve_seat_plan(
     quantities: List[int],
     seed: int = 42,
 ) -> Dict[str, Any]:
-    """求解考场卷别排布，返回可行方案；限时内无法判定时返回 error。
+    """求解考场卷别排布；只有逐层被证实最优时才返回可行方案。
 
     unavailable 为 (行, 列) 列表（均从 0 起，已由接口层去重并校验在界内）；
     quantities 为按卷号 0..P-1 的各卷印量，长度为卷数（2~5），总和已由
     接口层校验等于可用座位数。
+
+    任一层（接触边目标 / 任一行优先破平分块）在限时内仅得到可行解而未证明
+    最优、或无法判定时，返回 error 结构且不包含任何部分排布字段。
     """
     P = len(quantities)
     blocked = set(unavailable)
@@ -134,7 +140,12 @@ def solve_seat_plan(
         ],
     }
 
-    # 阶段 1：同卷别接触边总数最少
+    def _error(message: str) -> Dict[str, Any]:
+        # 回显入参字段，但绝不携带 grid/seats/empty_seats/contact_edges 等部分方案
+        return {"status": "error", **base, "error": message}
+
+    # 阶段 1：同卷别接触边总数最少——必须证实最优（OPTIMAL），
+    # 仅找到可行解（FEASIBLE）不能作为“最少接触边”返回。
     m, z, contact = _build_model(rows, cols, available, quantities)
     m.Minimize(contact)
     s = _solver(seed)
@@ -146,19 +157,19 @@ def solve_seat_plan(
             "message": "不存在满足各卷印量的座位分配方案",
             **base,
         }
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return {
-            "status": "error",
-            **base,
-            "error": "求解器在规定时间内无法判定可行性",
-        }
+    if status == cp_model.FEASIBLE:
+        return _error("求解器在规定时间内仅找到可行排布，未能证明接触边数最少")
+    if status != cp_model.OPTIMAL:
+        return _error("求解器在规定时间内无法判定可行性")
     best_contact = int(s.Value(contact))
-    chosen = [[bool(s.Value(z[sx][p])) for p in range(P)] for sx in range(S)]
 
     # 阶段 2：行优先、卷号升序固定结果——逐块最小化行优先卷号序列的 P 进制编码，
     # 并固定此前各块的最优值；座位/卷别间的对称被唯一破缺，结果可复现。
+    # 每一个分块同样必须证实最优：仅得可行解（其块值可能偏大，后续分块会在
+    # 错误的固定值下继续）或无法判定时，不能沿用上一分块/阶段的排布冒充最优。
     n_chunks = (S + CHUNK_BITS - 1) // CHUNK_BITS
     fixed: List[Tuple[int, int]] = []  # (块 k, 块值)
+    chosen: List[List[bool]] = []  # S=0（全场不可用、印量全为 0）时保持空排布
     for k in range(n_chunks):
         m, z, contact = _build_model(rows, cols, available, quantities)
         m.Add(contact == best_contact)
@@ -170,11 +181,20 @@ def solve_seat_plan(
         m.Minimize(enc)
         s = _solver(seed)
         status = s.Solve(m)
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            break  # 保留此前已得的最优排布
+        if status == cp_model.FEASIBLE:
+            return _error(
+                f"求解器在规定时间内仅找到可行排布，未能证明第 {k + 1} 个"
+                f"行优先破平分块最优"
+            )
+        if status != cp_model.OPTIMAL:
+            if status == cp_model.INFEASIBLE:
+                # 固定此前已证最优的各块后不应无解；到达即说明状态异常，保守拒绝
+                return _error("固定已证最优的破平分块后不存在可行排布")
+            return _error("求解器在规定时间内无法判定可行性")
         fixed.append((k, int(s.Value(enc))))
         chosen = [[bool(s.Value(z[sx][p])) for p in range(P)] for sx in range(S)]
 
+    # S=0 时没有任何分块需要证明，空排布即唯一方案；S>=1 时各分块均已证实最优。
     papers: List[int] = [
         next(p for p in range(P) if chosen[sx][p]) for sx in range(S)
     ]

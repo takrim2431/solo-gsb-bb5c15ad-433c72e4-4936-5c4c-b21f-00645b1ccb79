@@ -495,6 +495,8 @@ curl -X POST http://localhost:8000/api/tasks/42/review-plan \
 
 为一份**已完成、结果可行且含 2～5 份平行卷**的组卷任务生成考场卷别排布：把各卷按其**印量**分配到不超过 6×6 的考场座位上，在严格满足各卷印量的前提下使**同卷别接触边数最少**（尽量打散同卷相邻）。排布在**同一个 CP-SAT 模型**中求解并**同步返回**——不产生新任务、不写库；同一任务同一请求重复调用结果完全一致（可复现）。
 
+> **只有逐层被证明最优时才返回 `feasible`**：接触边总数（第 1 目标）与行优先破平的每一个分块（第 2 目标）都必须在每阶段限时（10 秒）内取得求解器的 **OPTIMAL** 结论。若某阶段限时内**仅找到可行解而未证明最优**（FEASIBLE）或无法判定，则该次排布**不能**沿用上一阶段的方案冒充最优：接口返回 `status="error"`，仅回显入参与 `error` 说明，**不包含任何部分排布**（无 `grid` / `seats` / `empty_seats` / `contact_edges`）。缩小考场或稍后重试即可重新求解；接口本身（HTTP 200、任务状态检查、输入校验码）保持不变。
+
 - 源任务仅允许状态为 `done`、结果为 `feasible` 且卷数为 2～5：任务不存在返回 `404`；未完成、无结果或结果不可行返回 `422`；单卷任务（`paper_count` 缺省或为 `1`）返回 `422`。
 - 硬约束：
   - 每个**可用座位**恰好放置 1 份卷；不可用座位（缺考/隔离位等）始终为空、不参与排布；
@@ -575,6 +577,58 @@ curl -X POST http://localhost:8000/api/tasks/42/seat-plan \
 - 印量总和不等于可用座位数、印量为负、不可用座位越界或重复、行列数超出 1～6、出现未知字段：均返回 `422`（Pydantic 校验明细）；
 - 印量条数与源任务卷数不一致（如三卷任务只给 2 个印量）：`422` 并提示需按卷号 `0~N-1` 逐卷给出；
 - 源任务不是 `done` + `feasible`，或源任务不是 2～5 份平行卷：`422`；任务不存在：`404`。
+
+### 限时未证明最优（`status="error"`）
+
+调用方式与成功时完全相同（仍为 `POST /api/tasks/{task_id}/seat-plan`，HTTP 状态码 `200`）。当接触边目标或任一行优先破平分块在 10 秒/阶段的限时内**仅找到可行解但未证明最优**（或无法判定）时，返回 error 结构，**不含任何部分排布字段**；重试可重新求解。例如对 6×6 考场（36 个座位，破平分为 2 个分块）：
+
+```bash
+curl -X POST http://localhost:8000/api/tasks/42/seat-plan \
+  -H "Content-Type: application/json" \
+  -d '{
+    "rows": 6,
+    "cols": 6,
+    "unavailable_seats": [],
+    "quantities": [18, 18]
+  }'
+```
+
+接触边目标未证明最优：
+
+```json
+{
+  "task_id": 42,
+  "status": "error",
+  "rows": 4,
+  "cols": 4,
+  "paper_count": 2,
+  "quantities": [7, 7],
+  "available_seats": 14,
+  "unavailable_seats": [
+    {"row": 0, "col": 0},
+    {"row": 3, "col": 3}
+  ],
+  "error": "求解器在规定时间内仅找到可行排布，未能证明接触边数最少"
+}
+```
+
+某个行优先破平分块未证明最优（错误信息给出第几个分块，从 1 起；考场超过 20 个可用座位时才会出现多个分块）：
+
+```json
+{
+  "task_id": 42,
+  "status": "error",
+  "rows": 6,
+  "cols": 6,
+  "paper_count": 2,
+  "quantities": [18, 18],
+  "available_seats": 36,
+  "unavailable_seats": [],
+  "error": "求解器在规定时间内仅找到可行排布，未能证明第 2 个行优先破平分块最优"
+}
+```
+
+完全无法在限时内判定可行性时，`error` 为 `"求解器在规定时间内无法判定可行性"`。三种 error 响应都只回显 `rows` / `cols` / `paper_count` / `quantities` / `available_seats` / `unavailable_seats` 与 `error`，客户端应据 `status` 字段区分成功与失败，**不要**在 error 时读取排布字段。
 
 ## 组卷模板（可版本化）
 
